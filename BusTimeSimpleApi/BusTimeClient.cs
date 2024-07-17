@@ -13,7 +13,7 @@ public class BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOp
 {
     private const string BaseAddress = "https://ru.busti.me/";
 
-    private static readonly string CacheDirectoryPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BusTime");
+    private static readonly string CacheDirectoryPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BusTime");
     private static readonly string CitiesJsonPath = Path.Combine(CacheDirectoryPath, "cities.json");
     private static readonly string StationsDirectoryPath = Path.Combine(CacheDirectoryPath, "stations");
 
