@@ -1,7 +1,10 @@
+using System.Security.Claims;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Threading.RateLimiting;
 using BusTimeSimpleApi;
 using Hangfire;
+using Microsoft.AspNetCore.Authentication.Negotiate;
 using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
 
@@ -40,6 +43,11 @@ builder.Services.AddControllers(o =>
     }
 }).AddJsonOptions(o => o.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase);
 
+builder.Services.AddAuthentication().AddNegotiate();
+
+builder.Services.AddAuthorization(o => o.AddPolicy("Admin", ao =>
+    ao.AddAuthenticationSchemes(NegotiateDefaults.AuthenticationScheme).RequireAuthenticatedUser()));
+
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -65,7 +73,7 @@ app.UseResponseCaching();
 app.UseAuthorization();
 
 app.MapControllers();
-app.MapHangfireDashboard();
+app.MapHangfireDashboard().RequireAuthorization("Admin");
 
 var recurringJobManager = app.Services.GetRequiredService<IRecurringJobManager>();
 var scheduleConfiguration = app.Configuration.GetSection("UpdateSchedule");
