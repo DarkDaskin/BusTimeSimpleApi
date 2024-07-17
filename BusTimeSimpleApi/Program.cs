@@ -60,9 +60,11 @@ var app = builder.Build();
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseDeveloperExceptionPage();
 }
+
+app.UseSwagger();
+app.UseSwaggerUI();
 
 app.UseHttpsRedirection();
 
@@ -74,6 +76,12 @@ app.UseAuthorization();
 
 app.MapControllers();
 app.MapHangfireDashboard().RequireAuthorization("Admin");
+
+app.MapGet("", context =>
+{ 
+    context.Response.Redirect("swagger/");
+    return Task.CompletedTask;
+});
 
 var recurringJobManager = app.Services.GetRequiredService<IRecurringJobManager>();
 var scheduleConfiguration = app.Configuration.GetSection("UpdateSchedule");
