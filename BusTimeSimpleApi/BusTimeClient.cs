@@ -3,13 +3,14 @@ using System.Threading.RateLimiting;
 using AngleSharp;
 using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
+using AngleSharp.Io.Network;
 using BusTimeSimpleApi.Models;
 using Microsoft.AspNetCore.Http.Json;
 using Microsoft.Extensions.Options;
 
 namespace BusTimeSimpleApi;
 
-public class BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOptions)
+public class BusTimeClient
 {
     private const string BaseAddress = "https://ru.busti.me/";
 
@@ -17,20 +18,34 @@ public class BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOp
     private static readonly string CitiesJsonPath = Path.Combine(CacheDirectoryPath, "cities.json");
     private static readonly string StationsDirectoryPath = Path.Combine(CacheDirectoryPath, "stations");
 
-    private readonly JsonSerializerOptions _jsonSerializerOptions = jsonOptions.Value.SerializerOptions;
-    private readonly IBrowsingContext _browsingContext = BrowsingContext.New(Configuration.Default.WithDefaultLoader()
-        .WithRequesters(new ClientSideRateLimitedHandler(rateLimiter)));
+    private readonly JsonSerializerOptions _jsonSerializerOptions;
+    private readonly IBrowsingContext _browsingContext;
     private readonly HashSet<string> _existingCities = new();
     private readonly SemaphoreSlim _existingCitiesSemaphore = new(1, 1);
     private readonly Dictionary<int, ForecastRequestInfo> _forecastRequestInfos = new();
     private readonly SemaphoreSlim _forecastRequestInfosSemaphore = new(1, 1);
+
+    public BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOptions)
+    {
+        var httpClient = new HttpClient(new ClientSideRateLimitedHandler(rateLimiter))
+        {
+            DefaultRequestHeaders =
+            {
+                // Maintain cities sorting made for Russia.
+                AcceptLanguage = { new("ru") },
+                UserAgent = { new("BusTimeSimpleApi", "1.0") },
+            }
+        };
+        _browsingContext = BrowsingContext.New(Configuration.Default.With(new HttpClientRequester(httpClient)).WithDefaultLoader());
+        _jsonSerializerOptions = jsonOptions.Value.SerializerOptions;
+    }
 
     public string CitiesJsonLocation => CitiesJsonPath;
 
     public async Task UpdateCitiesAsync()
     {
         var document = await _browsingContext.OpenAsync($"{BaseAddress}");
-        var items = document.QuerySelectorAll<IHtmlAnchorElement>("#main_container .item");
+        var items = document.QuerySelectorAll<IHtmlAnchorElement>(".accordion .item");
         var cities = items.Select(item => new City(
             Code: ExtractCode(item.Href),
             Name: item.Title?.Split(',').First() ?? "",
