@@ -11,6 +11,7 @@
     <PackageReference Include="AngleSharp.Io" Version="1.0.0" />
     <PackageReference Include="Hangfire.AspNetCore" Version="1.8.14" />
     <PackageReference Include="Hangfire.InMemory" Version="0.10.3" />
+    <PackageReference Include="Karambolo.Extensions.Logging.File" Version="3.5.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="8.0.7" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>

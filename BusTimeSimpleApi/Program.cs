@@ -1,5 +1,3 @@
-using System.Security.Claims;
-using System.Security.Principal;
 using System.Text.Json;
 using System.Threading.RateLimiting;
 using BusTimeSimpleApi;
@@ -54,6 +52,8 @@ builder.Services.AddSwaggerGen();
 
 builder.Services.AddHangfire(o => o.UseInMemoryStorage());
 builder.Services.AddHangfireServer();
+
+builder.Services.AddLogging(o => o.AddFile(fo => fo.RootPath = builder.Environment.ContentRootPath));
 
 var app = builder.Build();
 
