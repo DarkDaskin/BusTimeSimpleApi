@@ -1,3 +1,3 @@
 ﻿namespace BusTimeSimpleApi.Models;
 
-public record Station(int Id, string Code, string Name, string Direction);
+public record Station(int Id, string Code, string Name, string Direction, StationType Type);

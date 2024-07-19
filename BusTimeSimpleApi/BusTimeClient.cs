@@ -139,6 +139,9 @@ public class BusTimeClient
         {
             var stationGroupDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/{stationGroup.Code}/");
             var stationArrows = stationGroupDocument.QuerySelectorAll("h3 .fa-arrow-right");
+            var stationRoutes = stationGroupDocument.QuerySelectorAll("h3").First(h3 => h3.TextContent.Contains("Маршруты"))
+                .ParentElement?.QuerySelectorAll<IHtmlAnchorElement>("a") ?? [];
+            var stationType = stationRoutes.All(route => route.Href.Contains("tramway")) ? StationType.Tram : StationType.Regular;
             foreach (var arrow in stationArrows)
             {
                 var column = arrow.Ancestors<IHtmlDivElement>().First(ancestor => ancestor.ClassList.Contains("column"));
@@ -146,7 +149,8 @@ public class BusTimeClient
                     Id: int.Parse(ExtractCode((column.QuerySelector(".fa-desktop")?.ParentElement as IHtmlAnchorElement)?.Href ?? "0")),
                     Code: stationGroup.Code, 
                     Name: stationGroup.Name, 
-                    Direction: arrow.ParentElement!.TextContent);
+                    Direction: arrow.ParentElement!.TextContent,
+                    Type: stationType);
                 allStations.Add(station);
             }
         }
