@@ -64,13 +64,15 @@ public class BusTimeClient
         }
 
         EnsureDirectory(CitiesJsonPath);
-        await using var jsonStream = File.OpenWrite(CitiesJsonPath);
+        await using var jsonStream = OpenWrite(CitiesJsonPath);
         await JsonSerializer.SerializeAsync(jsonStream, cities, _jsonSerializerOptions);
     }
 
     private static string ExtractCode(string url) => url.Split('/', StringSplitOptions.RemoveEmptyEntries).Last();
 
     private static void EnsureDirectory(string path) => Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
+    private static FileStream OpenWrite(string path) => File.Open(path, FileMode.Create);
 
     private void UpdateExistingCities(IEnumerable<City> cities)
     {
@@ -168,7 +170,7 @@ public class BusTimeClient
 
         var path = GetStationJsonLocation(cityCode);
         EnsureDirectory(path);
-        await using var jsonStream = File.OpenWrite(path);
+        await using var jsonStream = OpenWrite(path);
         await JsonSerializer.SerializeAsync(jsonStream, allStations, _jsonSerializerOptions);
     }
 
