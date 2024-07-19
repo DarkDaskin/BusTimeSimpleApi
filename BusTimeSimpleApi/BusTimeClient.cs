@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Diagnostics;
+using System.Text.Json;
 using System.Threading.RateLimiting;
 using AngleSharp;
 using AngleSharp.Dom;
@@ -109,51 +110,65 @@ public class BusTimeClient
 
     public string GetStationJsonLocation(string cityCode) => Path.Combine(StationsDirectoryPath, $"{cityCode}.json");
 
-    public async Task UpdateStationsAsync()
+    public async Task UpdateStationsAsync(bool fullUpdate = false)
     {
         var cities = await ReadCitiesAsync();
 
         foreach (var city in cities)
-            await UpdateStationsAsync(city.Code);
+            await UpdateStationsAsync(city.Code, fullUpdate);
     }
 
-    private async Task<IEnumerable<City>> ReadCitiesAsync()
+    private async Task<IReadOnlyCollection<City>> ReadCitiesAsync()
     {
         if (!File.Exists(CitiesJsonPath))
             await UpdateCitiesAsync();
 
         await using var jsonStream = File.OpenRead(CitiesJsonPath);
-        return (await JsonSerializer.DeserializeAsync<IEnumerable<City>>(jsonStream, _jsonSerializerOptions))!;
+        return (await JsonSerializer.DeserializeAsync<IReadOnlyCollection<City>>(jsonStream, _jsonSerializerOptions))!;
     }
 
-    public async Task UpdateStationsAsync(string cityCode)
+    public async Task UpdateStationsAsync(string cityCode, bool fullUpdate = false)
     {
         var stationListDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/");
         var stationListItems = stationListDocument.QuerySelectorAll<IHtmlAnchorElement>("#main_container .item");
-        var stationGroups = stationListItems.Select(item => new StationGroup
+        var stationGroups = stationListItems.Select(item => new StationGroup(
+            Code: ExtractCode(item.Href), 
+            Name: item.TextContent.Trim()));
+
+        ILookup<string, Station>? existingStationsByCode = null;
+        if (!fullUpdate)
         {
-            Code = ExtractCode(item.Href),
-            Name = item.TextContent.Trim(),
-        });
+            var existingStations = await ReadStationsAsync(cityCode);
+            existingStationsByCode = existingStations?.ToLookup(station => station.Code);
+        }
 
         var allStations = new List<Station>();
         foreach (var stationGroup in stationGroups)
         {
-            var stationGroupDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/{stationGroup.Code}/");
-            var stationArrows = stationGroupDocument.QuerySelectorAll("h3 .fa-arrow-right");
-            var stationRoutes = stationGroupDocument.QuerySelectorAll("h3").First(h3 => h3.TextContent.Contains("Маршруты"))
-                .ParentElement?.QuerySelectorAll<IHtmlAnchorElement>("a") ?? [];
-            var stationType = stationRoutes.All(route => route.Href.Contains("tramway")) ? StationType.Tram : StationType.Regular;
-            foreach (var arrow in stationArrows)
+            var requiresUpdate = fullUpdate || !(existingStationsByCode?.Contains(stationGroup.Code) ?? false);
+            if (requiresUpdate)
             {
-                var column = arrow.Ancestors<IHtmlDivElement>().First(ancestor => ancestor.ClassList.Contains("column"));
-                var station = new Station(
-                    Id: int.Parse(ExtractCode((column.QuerySelector(".fa-desktop")?.ParentElement as IHtmlAnchorElement)?.Href ?? "0")),
-                    Code: stationGroup.Code, 
-                    Name: stationGroup.Name, 
-                    Direction: arrow.ParentElement!.TextContent,
-                    Type: stationType);
-                allStations.Add(station);
+                var stationGroupDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/{stationGroup.Code}/");
+                var stationArrows = stationGroupDocument.QuerySelectorAll("h3 .fa-arrow-right");
+                var stationRoutes = stationGroupDocument.QuerySelectorAll("h3").First(h3 => h3.TextContent.Contains("Маршруты"))
+                    .ParentElement?.QuerySelectorAll<IHtmlAnchorElement>("a") ?? [];
+                var stationType = stationRoutes.All(route => route.Href.Contains("tramway")) ? StationType.Tram : StationType.Regular;
+                foreach (var arrow in stationArrows)
+                {
+                    var column = arrow.Ancestors<IHtmlDivElement>().First(ancestor => ancestor.ClassList.Contains("column"));
+                    var station = new Station(
+                        Id: int.Parse(ExtractCode((column.QuerySelector(".fa-desktop")?.ParentElement as IHtmlAnchorElement)?.Href ?? "0")),
+                        Code: stationGroup.Code,
+                        Name: stationGroup.Name,
+                        Direction: arrow.ParentElement!.TextContent,
+                        Type: stationType);
+                    allStations.Add(station);
+                }
+            }
+            else
+            {
+                Debug.Assert(existingStationsByCode != null, nameof(existingStationsByCode) + " != null");
+                allStations.AddRange(existingStationsByCode[stationGroup.Code]);
             }
         }
 
@@ -172,6 +187,16 @@ public class BusTimeClient
         EnsureDirectory(path);
         await using var jsonStream = OpenWrite(path);
         await JsonSerializer.SerializeAsync(jsonStream, allStations, _jsonSerializerOptions);
+    }
+
+    private async Task<IReadOnlyCollection<Station>?> ReadStationsAsync(string cityCode)
+    {
+        var stationsJsonLocation = GetStationJsonLocation(cityCode);
+        if (!File.Exists(stationsJsonLocation))
+            return null;
+
+        await using var jsonStream = File.OpenRead(stationsJsonLocation);
+        return (await JsonSerializer.DeserializeAsync<IReadOnlyCollection<Station>>(jsonStream, _jsonSerializerOptions))!;
     }
 
     private async Task UpdateForecastRequestInfosAsync()

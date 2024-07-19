@@ -86,6 +86,7 @@ app.MapGet("", context =>
 var recurringJobManager = app.Services.GetRequiredService<IRecurringJobManager>();
 var scheduleConfiguration = app.Configuration.GetSection("UpdateSchedule");
 recurringJobManager.AddOrUpdate<BusTimeClient>("update-cities", client => client.UpdateCitiesAsync(), scheduleConfiguration["Cities"]);
-recurringJobManager.AddOrUpdate<BusTimeClient>("update-stations", client => client.UpdateStationsAsync(), scheduleConfiguration["Stations"]);
+recurringJobManager.AddOrUpdate<BusTimeClient>("update-stations-delta", client => client.UpdateStationsAsync(false), scheduleConfiguration["StationsDelta"]);
+recurringJobManager.AddOrUpdate<BusTimeClient>("update-stations-full", client => client.UpdateStationsAsync(true), scheduleConfiguration["StationsFull"]);
 
 app.Run();
