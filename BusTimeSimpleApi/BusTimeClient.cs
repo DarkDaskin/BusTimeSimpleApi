@@ -19,14 +19,15 @@ public class BusTimeClient
     private static readonly string CitiesJsonPath = Path.Combine(CacheDirectoryPath, "cities.json");
     private static readonly string StationsDirectoryPath = Path.Combine(CacheDirectoryPath, "stations");
 
-    private readonly JsonSerializerOptions _jsonSerializerOptions;
     private readonly IBrowsingContext _browsingContext;
+    private readonly JsonSerializerOptions _jsonSerializerOptions;
+    private readonly ILogger<BusTimeClient> _logger;
     private readonly HashSet<string> _existingCities = new();
     private readonly SemaphoreSlim _existingCitiesSemaphore = new(1, 1);
     private readonly Dictionary<int, ForecastRequestInfo> _forecastRequestInfos = new();
     private readonly SemaphoreSlim _forecastRequestInfosSemaphore = new(1, 1);
 
-    public BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOptions)
+    public BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOptions, ILogger<BusTimeClient> logger)
     {
         var httpClient = new HttpClient(new ClientSideRateLimitedHandler(rateLimiter))
         {
@@ -39,12 +40,15 @@ public class BusTimeClient
         };
         _browsingContext = BrowsingContext.New(Configuration.Default.With(new HttpClientRequester(httpClient)).WithDefaultLoader());
         _jsonSerializerOptions = jsonOptions.Value.SerializerOptions;
+        _logger = logger;
     }
 
     public string CitiesJsonLocation => CitiesJsonPath;
 
     public async Task UpdateCitiesAsync()
     {
+        _logger.LogInformation("Updating city list...");
+
         var document = await _browsingContext.OpenAsync($"{BaseAddress}");
         var items = document.QuerySelectorAll<IHtmlAnchorElement>(".accordion .item");
         var cities = items.Select(item => new City(
@@ -67,6 +71,8 @@ public class BusTimeClient
         EnsureDirectory(CitiesJsonPath);
         await using var jsonStream = OpenWrite(CitiesJsonPath);
         await JsonSerializer.SerializeAsync(jsonStream, cities, _jsonSerializerOptions);
+
+        _logger.LogInformation("City list updated with {Count} entries.", cities.Length);
     }
 
     private static string ExtractCode(string url) => url.Split('/', StringSplitOptions.RemoveEmptyEntries).Last();
@@ -112,10 +118,14 @@ public class BusTimeClient
 
     public async Task UpdateStationsAsync(bool fullUpdate = false)
     {
+        _logger.LogInformation("Updating station list ({UpdateType} update)...", fullUpdate ? "full" : "delta");
+
         var cities = await ReadCitiesAsync();
 
         foreach (var city in cities)
             await UpdateStationsAsync(city.Code, fullUpdate);
+
+        _logger.LogInformation("Station list updated for {Count} cities.", cities.Count);
     }
 
     private async Task<IReadOnlyCollection<City>> ReadCitiesAsync()
@@ -129,11 +139,13 @@ public class BusTimeClient
 
     public async Task UpdateStationsAsync(string cityCode, bool fullUpdate = false)
     {
+        _logger.LogInformation("Updating station list for '{CityCode}' ({UpdateType} update)...", cityCode, fullUpdate ? "full" : "delta");
+
         var stationListDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/");
         var stationListItems = stationListDocument.QuerySelectorAll<IHtmlAnchorElement>("#main_container .item");
         var stationGroups = stationListItems.Select(item => new StationGroup(
             Code: ExtractCode(item.Href), 
-            Name: item.TextContent.Trim()));
+            Name: item.TextContent.Trim())).ToArray();
 
         ILookup<string, Station>? existingStationsByCode = null;
         if (!fullUpdate)
@@ -143,16 +155,22 @@ public class BusTimeClient
         }
 
         var allStations = new List<Station>();
+        var stationGroupsProcessedCount = 0;
+        const int reportPercentage = 10;
+        var reportMilestone = stationGroups.Length * reportPercentage / 100;
         foreach (var stationGroup in stationGroups)
         {
             var requiresUpdate = fullUpdate || !(existingStationsByCode?.Contains(stationGroup.Code) ?? false);
             if (requiresUpdate)
             {
+                _logger.LogDebug("Updating stations for group '{StationCode}'...", stationGroup.Code);
+
                 var stationGroupDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/{stationGroup.Code}/");
                 var stationArrows = stationGroupDocument.QuerySelectorAll("h3 .fa-arrow-right");
                 var stationRoutes = stationGroupDocument.QuerySelectorAll("h3").First(h3 => h3.TextContent.Contains("Маршруты"))
                     .ParentElement?.QuerySelectorAll<IHtmlAnchorElement>("a") ?? [];
                 var stationType = stationRoutes.All(route => route.Href.Contains("tramway")) ? StationType.Tram : StationType.Regular;
+                var addedStationCount = 0;
                 foreach (var arrow in stationArrows)
                 {
                     var column = arrow.Ancestors<IHtmlDivElement>().First(ancestor => ancestor.ClassList.Contains("column"));
@@ -163,13 +181,21 @@ public class BusTimeClient
                         Direction: arrow.ParentElement!.TextContent,
                         Type: stationType);
                     allStations.Add(station);
+                    addedStationCount++;
                 }
+
+                _logger.LogDebug("Stations for group '{StationCode}' updated with {Count} entries.", stationGroup.Code, addedStationCount);
             }
             else
             {
                 Debug.Assert(existingStationsByCode != null, nameof(existingStationsByCode) + " != null");
                 allStations.AddRange(existingStationsByCode[stationGroup.Code]);
             }
+
+            stationGroupsProcessedCount++;
+            if (stationGroupsProcessedCount % reportMilestone == 0) 
+                _logger.LogInformation("Station list update for '{CityCode}' done for {Count}/{TotalCount} station groups.", cityCode, stationGroupsProcessedCount, stationGroups.Length);
+            
         }
 
         // Waits have to be done outside this method as sepaphores are not reentrant.
@@ -187,6 +213,8 @@ public class BusTimeClient
         EnsureDirectory(path);
         await using var jsonStream = OpenWrite(path);
         await JsonSerializer.SerializeAsync(jsonStream, allStations, _jsonSerializerOptions);
+
+        _logger.LogInformation("Station list for '{CityCode}' updated with {Count} entries.", cityCode, allStations.Count);
     }
 
     private async Task<IReadOnlyCollection<Station>?> ReadStationsAsync(string cityCode)
@@ -229,6 +257,8 @@ public class BusTimeClient
 
     public async Task<IEnumerable<Forecast>?> GetForecastsAsync(int stationId)
     {
+        _logger.LogInformation("Getting forecast for station '{StationId}'...", stationId);
+
         IDocument document;
 
         await _forecastRequestInfosSemaphore.WaitAsync();
@@ -272,6 +302,9 @@ public class BusTimeClient
                 forecasts.Add(new Forecast(dateTime, parts[1], type));
             }
         }
+
+        _logger.LogInformation("Forecast for station '{StationId}' completed with {Count} entries.", stationId, forecasts.Count);
+
         return forecasts;
     }
 
