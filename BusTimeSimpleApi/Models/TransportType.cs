@@ -7,4 +7,6 @@ public enum TransportType
     Trolleybus,
     Tram,
     Metro,
+    TaxiBus,
+    IntercityBus,
 }

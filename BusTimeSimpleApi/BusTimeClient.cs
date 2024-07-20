@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.RateLimiting;
 using AngleSharp;
 using AngleSharp.Dom;
@@ -142,7 +143,7 @@ public class BusTimeClient
         _logger.LogInformation("Updating station list for '{CityCode}' ({UpdateType} update)...", cityCode, fullUpdate ? "full" : "delta");
 
         var stationListDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/");
-        var stationListItems = stationListDocument.QuerySelectorAll<IHtmlAnchorElement>("#main_container .item");
+        var stationListItems = stationListDocument.QuerySelectorAll<IHtmlAnchorElement>(".four .item");
         var stationGroups = stationListItems.Select(item => new StationGroup(
             Code: ExtractCode(item.Href), 
             Name: item.TextContent.Trim())).ToArray();
@@ -156,8 +157,7 @@ public class BusTimeClient
 
         var allStations = new List<Station>();
         var stationGroupsProcessedCount = 0;
-        const int reportPercentage = 10;
-        var reportMilestone = stationGroups.Length * reportPercentage / 100;
+        const int reportMilestone = 20;
         foreach (var stationGroup in stationGroups)
         {
             var requiresUpdate = fullUpdate || !(existingStationsByCode?.Contains(stationGroup.Code) ?? false);
@@ -252,7 +252,8 @@ public class BusTimeClient
         }
 
         foreach (var station in stations)
-                _forecastRequestInfos.Add(station.Id, new ForecastRequestInfo(cityCode, station.Code));
+            if (!_forecastRequestInfos.TryAdd(station.Id, new ForecastRequestInfo(cityCode, station.Code)))
+                _logger.LogWarning("Duplicate station ID {StationId}", station.Id);
     }
 
     public async Task<IEnumerable<Forecast>?> GetForecastsAsync(int stationId)
@@ -284,22 +285,38 @@ public class BusTimeClient
         foreach (var row in rows)
         {
             var time = TimeOnly.Parse(row.Cells[0].TextContent);
-            var dateTime = time >= TimeOnly.FromDateTime(DateTime.Now)
+            var dateTime = time >= TimeOnly.FromDateTime(DateTime.Now).AddHours(-1)
                 ? DateTime.Today + time.ToTimeSpan()
                 : DateTime.Today + time.ToTimeSpan() + TimeSpan.FromDays(1);
-            var routeNumbers = row.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a");
-            foreach (var routeNumber in routeNumbers)
+            var routeNumberAnchors = row.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a");
+            foreach (var routeNumberAnchor in routeNumberAnchors)
             {
-                var parts = ExtractCode(routeNumber.Href).Split('-', 2);
-                var type = parts[0] switch
+                var routeCode = ExtractCode(routeNumberAnchor.Href);
+                var match = Regex.Match(routeCode, @"([\w-]+-)?(?<type>bus(?:-taxi)?(?:-intercity)?|trolleybus|tramway|metro)-(?<route>[\w-]+)");
+                var type = TransportType.Unknown;
+                if (match.Success)
                 {
-                    "bus" => TransportType.Bus,
-                    "trolleybus" => TransportType.Trolleybus,
-                    "tramway" => TransportType.Tram,
-                    "metro" => TransportType.Metro, // TODO: confirm it works correctly
-                    _ => TransportType.Unknown
+                    type = match.Groups["type"].Value switch
+                    {
+                        "bus" => TransportType.Bus,
+                        "trolleybus" => TransportType.Trolleybus,
+                        "tramway" => TransportType.Tram,
+                        "metro" => TransportType.Metro,
+                        "bus-taxi" => TransportType.TaxiBus,
+                        "bus-intercity" => TransportType.IntercityBus,
+                        _ => TransportType.Unknown
+                    };
+                }
+                var routeNumber = routeNumberAnchor.TextContent.Trim();
+                routeNumber = type switch
+                {
+                    TransportType.Trolleybus when routeNumber.StartsWith("Т") => routeNumber[1..],
+                    TransportType.Tram when routeNumber.StartsWith("ТВ") => routeNumber[2..],
+                    TransportType.TaxiBus when routeNumber.StartsWith("МТ") => routeNumber[2..],
+                    TransportType.IntercityBus when routeNumber.StartsWith("МА") => routeNumber[2..],
+                    _ => routeNumber
                 };
-                forecasts.Add(new Forecast(dateTime, parts[1], type));
+                forecasts.Add(new Forecast(dateTime, routeNumber, type));
             }
         }
 
