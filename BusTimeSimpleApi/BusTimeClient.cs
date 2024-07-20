@@ -260,7 +260,8 @@ public class BusTimeClient
     {
         _logger.LogInformation("Getting forecast for station '{StationId}'...", stationId);
 
-        IDocument document;
+        IDocument stationDocument;
+        ForecastRequestInfo requestInfo;
 
         await _forecastRequestInfosSemaphore.WaitAsync();
         try
@@ -268,27 +269,30 @@ public class BusTimeClient
             if (_forecastRequestInfos.Count == 0)
                 await UpdateForecastRequestInfosAsync();
 
-            if (!_forecastRequestInfos.TryGetValue(stationId, out var requestInfo))
+            if (!_forecastRequestInfos.TryGetValue(stationId, out requestInfo))
                 return null;
 
-            document = await _browsingContext.OpenAsync($"{BaseAddress}{requestInfo.CityCode}/stop/{requestInfo.StationCode}/");
+            stationDocument = await _browsingContext.OpenAsync($"{BaseAddress}{requestInfo.CityCode}/stop/{requestInfo.StationCode}/");
         }
         finally
         {
             _forecastRequestInfosSemaphore.Release();
         }
 
-        var rows = document.QuerySelector($"a[href$='/{stationId}/']")?.Ancestors<IHtmlDivElement>()
-            .First(ancestor => ancestor.ClassList.Contains(["column", "wide"]))
-            .QuerySelectorAll<IHtmlTableRowElement>("table tbody tr") ?? [];
+        var forecastContainer = stationDocument.QuerySelector($"a[href$='/{stationId}/']")?.Ancestors<IHtmlDivElement>()
+            .First(ancestor => ancestor.ClassList.Contains(["column", "wide"]));
+        var stationName = stationDocument.QuerySelector("h1")?.FindChild<IText>()?.TextContent.Trim() ?? "";
+        var direction = forecastContainer?.QuerySelector("h3")?.TextContent.Trim() ?? "";
+        var forecastRows = forecastContainer?.QuerySelectorAll<IHtmlTableRowElement>("table tbody tr") ?? [];
         var forecasts = new List<Forecast>();
-        foreach (var row in rows)
+        var stationsByRoute = new Dictionary<string, List<StationVehicleInfo>>();
+        foreach (var forecastRow in forecastRows)
         {
-            var time = TimeOnly.Parse(row.Cells[0].TextContent);
+            var time = TimeOnly.Parse(forecastRow.Cells[0].TextContent);
             var dateTime = time >= TimeOnly.FromDateTime(DateTime.Now).AddHours(-1)
                 ? DateTime.Today + time.ToTimeSpan()
                 : DateTime.Today + time.ToTimeSpan() + TimeSpan.FromDays(1);
-            var routeNumberAnchors = row.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a");
+            var routeNumberAnchors = forecastRow.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a");
             foreach (var routeNumberAnchor in routeNumberAnchors)
             {
                 var routeCode = ExtractCode(routeNumberAnchor.Href);
@@ -316,17 +320,81 @@ public class BusTimeClient
                     TransportType.IntercityBus when routeNumber.StartsWith("МА") => routeNumber[2..],
                     _ => routeNumber
                 };
-                forecasts.Add(new Forecast(dateTime, routeNumber, type));
+
+                if (!stationsByRoute.TryGetValue(routeCode, out var stations))
+                {
+                    _logger.LogDebug("Getting locations for route '{RouteCode}'...", routeCode);
+
+                    stations = [];
+                    var routeDocument = await _browsingContext.OpenAsync($"{BaseAddress}{requestInfo.CityCode}/{routeCode}/");
+                    var locationTable = routeDocument.QuerySelectorAll<IHtmlTableElement>(".two table").FirstOrDefault(table => 
+                        GetStationRowIndex(table, null, direction) - GetStationRowIndex(table, requestInfo.StationCode, stationName) == 1);
+                    if (locationTable != null)
+                    {
+                        foreach (var row in locationTable.Rows)
+                        {
+                            var rowStationName = GetStationName(row);
+                            var rowStationAnchor = row.QuerySelector<IHtmlAnchorElement>("a");
+                            var rowStationCode = rowStationAnchor == null ? null : ExtractCode(rowStationAnchor.Href);
+                            var hasVehicle = row.QuerySelector("img") != null;
+                            stations.Add(new StationVehicleInfo(rowStationName, rowStationCode, hasVehicle));
+                        }
+                        stationsByRoute.Add(routeCode, stations);
+
+                        _logger.LogDebug("Locations for route '{RouteCode}' loaded with {Count} entries.", routeCode, stations.Count);
+                    }
+                    else
+                        _logger.LogWarning("Locations for route '{RouteCode}' could not be determined.", routeCode);
+                }
+
+                string? lastStation = null, nextStation = null;
+                var currentStationIndex = stations.FindIndex(
+                    station => station.StationCode == requestInfo.StationCode || station.StationName == stationName);
+                for (var i = currentStationIndex; i >= 0; i--)
+                {
+                    var station = stations[i];
+                    if (station.HasVehicle)
+                    {
+                        lastStation = station.StationName;
+                        if (i < stations.Count - 1)
+                            nextStation = stations[i + 1].StationName;
+                        break;
+                    }
+                }
+
+                forecasts.Add(new Forecast(dateTime, routeNumber, type, lastStation, nextStation));
             }
         }
 
         _logger.LogInformation("Forecast for station '{StationId}' completed with {Count} entries.", stationId, forecasts.Count);
 
         return forecasts;
+
+
+        static int GetStationRowIndex(IHtmlTableElement table, string? stationCode, string stationName)
+        {
+            foreach (var row in table.Rows)
+            {
+                if (stationCode != null)
+                {
+                    var stationAnchor = row.QuerySelector<IHtmlAnchorElement>("a");
+                    if (stationAnchor != null && ExtractCode(stationAnchor.Href) == stationCode)
+                        return row.Index;
+                }
+
+                if (GetStationName(row) == stationName)
+                    return row.Index;
+            }
+            return -1;
+        }
+
+        static string GetStationName(IHtmlTableRowElement row) => row.QuerySelector("a, b")?.TextContent.Trim() ?? "";
     }
 
 
     private readonly record struct StationGroup(string Code, string Name);
 
     private readonly record struct ForecastRequestInfo(string CityCode, string StationCode);
+
+    private readonly record struct StationVehicleInfo(string StationName, string? StationCode, bool HasVehicle);
 }
