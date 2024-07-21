@@ -230,45 +230,22 @@ public class BusTimeClient
                 {
                     foreach (var station in currentGroupStations)
                     {
-                        _logger.LogDebug("Determining mapping for station {StationId}...", station.Id);
-
-                        var stationDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/id/{station.Id}/");
-                        var newUiForecastRows = stationDocument.QuerySelectorAll<IHtmlTableRowElement>("tbody.stop_result tr");
-                        var newUiForecasts = newUiForecastRows.Select(row => new ForecastCompareInfo(
-                                Time: TimeOnly.Parse(row.Cells[0].TextContent.Trim()),
-                                Route: Regex.Match(row.Cells[1].TextContent, @"(?<route>\S+)(?:\s+\+)?").Groups["route"].Value))
-                            .ToArray();
-                        foreach (var oldForecastTableMatch in oldUiForecastTablesByStationId.Values)
+                        if (!fullUpdate && existingStationMappings != null && existingStationMappings.TryGetValue(station.Id, out var mappedStationId))
                         {
-                            // Fuzzy compare forecast tables to determine closest match.
-                            const int toleranceMinutes = 2;
-                            var oldUiForecasts = oldForecastTableMatch.Table.Bodies[0].Rows
-                                .SelectMany(row => row.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a").Select(anchor =>
-                                    new ForecastCompareInfo(
-                                        Time: TimeOnly.Parse(row.Cells[0].TextContent),
-                                        Route: anchor.TextContent.Trim())));
-                            foreach (var oldUiForecast in oldUiForecasts)
-                            {
-                                if (newUiForecasts.Any(newUiForecast =>
-                                        // Old UI has transport type prefixes, new UI omits them on initial load.
-                                        oldUiForecast.Route.Contains(newUiForecast.Route, StringComparison.CurrentCultureIgnoreCase) &&
-                                        // Times may skew as pages were loaded at slightly different times, so do fuzzy compare.
-                                        Math.Abs(oldUiForecast.Time.Ticks - newUiForecast.Time.Ticks) / TimeSpan.TicksPerMinute <
-                                        toleranceMinutes))
-                                {
-                                    oldForecastTableMatch.Scores.TryAdd(station.Id, 0);
-                                    oldForecastTableMatch.Scores[station.Id]++;
-                                }
-                            }
+                            if (!AddStationMapping(station.Id, mappedStationId))
+                                unmappedStations.Add(station);
+
+                            continue;
                         }
 
-                        var closestMatch = oldUiForecastTablesByStationId.ToLookup(kv => kv.Value.Scores.GetValueOrDefault(station.Id, 0), kv => kv.Key)
-                            .MaxBy(g => g.Key);
-                        if (closestMatch is { Key: > 0 })
+                        _logger.LogDebug("Determining mapping for station {StationId}...", station.Id);
+
+                        var closestMatch = await GetClosestStationMatchByForecast(cityCode, station.Id, oldUiForecastTablesByStationId);
+                        if (closestMatch.Score > 0)
                         {
-                            if (closestMatch.Count() == 1)
+                            if (closestMatch.Count == 1)
                             {
-                                var mappedStationId = closestMatch.Single();
+                                mappedStationId = closestMatch.MappedStationId!.Value;
                                 oldUiForecastTablesByStationId[mappedStationId].StationId = station.Id;
                                 if (!AddStationMapping(station.Id, mappedStationId))
                                     unmappedStations.Add(station);
@@ -377,6 +354,50 @@ public class BusTimeClient
         return (await JsonSerializer.DeserializeAsync<Dictionary<int, int>>(jsonStream, _jsonSerializerOptions))!;
     }
 
+    private async Task<StationMatchInfo> GetClosestStationMatchByForecast(string cityCode, int stationId,
+        Dictionary<int, ForecastTableMatch> oldUiForecastTablesByStationId)
+    {
+        var stationDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/id/{stationId}/");
+        var newUiForecastRows = stationDocument.QuerySelectorAll<IHtmlTableRowElement>("tbody.stop_result tr");
+        var newUiForecasts = newUiForecastRows.Select(row => new ForecastCompareInfo(
+                Time: TimeOnly.Parse(row.Cells[0].TextContent.Trim()),
+                Route: Regex.Match(row.Cells[1].TextContent, @"(?<route>\S+)(?:\s+\+)?").Groups["route"].Value))
+            .ToArray();
+        foreach (var oldForecastTableMatch in oldUiForecastTablesByStationId.Values)
+        {
+            // Fuzzy compare forecast tables to determine closest match.
+            const int toleranceMinutes = 2;
+            var oldUiForecasts = oldForecastTableMatch.Table.Bodies[0].Rows
+                .SelectMany(row => row.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a").Select(anchor =>
+                    new ForecastCompareInfo(
+                        Time: TimeOnly.Parse(row.Cells[0].TextContent),
+                        Route: anchor.TextContent.Trim())));
+            foreach (var oldUiForecast in oldUiForecasts)
+            {
+                if (newUiForecasts.Any(newUiForecast =>
+                        // Old UI has transport type prefixes, new UI omits them on initial load.
+                        oldUiForecast.Route.Contains(newUiForecast.Route, StringComparison.CurrentCultureIgnoreCase) &&
+                        // Times may skew as pages were loaded at slightly different times, so do fuzzy compare.
+                        Math.Abs(oldUiForecast.Time.Ticks - newUiForecast.Time.Ticks) / TimeSpan.TicksPerMinute <
+                        toleranceMinutes))
+                {
+                    oldForecastTableMatch.Scores.TryAdd(stationId, 0);
+                    oldForecastTableMatch.Scores[stationId]++;
+                }
+            }
+        }
+
+        var closestMatch = oldUiForecastTablesByStationId.ToLookup(kv => kv.Value.Scores.GetValueOrDefault(stationId, 0), kv => kv.Key)
+            .MaxBy(g => g.Key);
+        var matchCount = closestMatch?.Count() ?? 0;
+        return new StationMatchInfo(
+            MappedStationId: (closestMatch == null || matchCount != 1) ? null : closestMatch.Single(),
+            Score: closestMatch?.Key ?? 0,
+            Count: matchCount,
+            HasForecasts: newUiForecasts.Any()
+        );
+    }
+
     private async Task UpdateForecastRequestInfosAsync()
     {
         var stationJsonFiles = Directory.EnumerateFiles(StationsDirectoryPath, "*.json");
@@ -426,7 +447,7 @@ public class BusTimeClient
     {
         _logger.LogInformation("Getting forecast for station '{StationId}'...", stationId);
 
-        IDocument stationDocument;
+        IDocument stationGroupDocument;
         ForecastRequestInfo requestInfo;
 
         await _forecastRequestInfosSemaphore.WaitAsync();
@@ -435,20 +456,96 @@ public class BusTimeClient
             if (_forecastRequestInfos.Count == 0)
                 await UpdateForecastRequestInfosAsync();
 
-            // TODO: try to map again
-            if (!_forecastRequestInfos.TryGetValue(stationId, out requestInfo) || requestInfo.MappedStationId == null)
+            if (!_forecastRequestInfos.TryGetValue(stationId, out requestInfo))
                 return null;
 
-            stationDocument = await _browsingContext.OpenAsync($"{BaseAddress}{requestInfo.CityCode}/stop/{requestInfo.StationCode}/");
+            stationGroupDocument = await _browsingContext.OpenAsync($"{BaseAddress}{requestInfo.CityCode}/stop/{requestInfo.StationCode}/");
         }
         finally
         {
             _forecastRequestInfosSemaphore.Release();
         }
 
-        var forecastContainer = GetForecastContainer(stationDocument, stationId);
-        var mappedForecastContainer = GetForecastContainer(stationDocument, requestInfo.MappedStationId.Value);
-        var stationName = stationDocument.QuerySelector("h1")?.FindChild<IText>()?.TextContent.Trim() ?? "";
+        if (requestInfo.MappedStationId == null)
+        {
+            _logger.LogDebug("Determining mapping for station {StationId}...", stationId);
+
+            var oldUiForecastTablesByStationId = stationGroupDocument.QuerySelectorAll<IHtmlTableElement>("table").ToDictionary(
+                table => int.Parse(ExtractCode(table.PreviousElementSibling?.QuerySelector<IHtmlAnchorElement>("a")?.Href ?? "0")),
+                table => new ForecastTableMatch(table));
+            var closestMatch = await GetClosestStationMatchByForecast(requestInfo.CityCode, stationId, oldUiForecastTablesByStationId);
+            if (closestMatch is { Score: > 0, Count: 1 })
+            {
+                await _forecastRequestInfosSemaphore.WaitAsync();
+                try
+                {
+                    var mappedStationId = closestMatch.MappedStationId!.Value;
+                    requestInfo = requestInfo with { MappedStationId = mappedStationId };
+                    _forecastRequestInfos[stationId] = requestInfo;
+
+                    Dictionary<int, int> stationMappings;
+                    var newMappingCount = 1;
+                    var path = GetStationMappingJsonLocation(requestInfo.CityCode);
+                    if (File.Exists(path))
+                    {
+                        await using var jsonStream = File.OpenRead(path);
+                        stationMappings = (await JsonSerializer.DeserializeAsync<Dictionary<int, int>>(jsonStream, _jsonSerializerOptions))!;
+                    }
+                    else
+                        stationMappings = [];
+
+                    stationMappings.Add(stationId, mappedStationId);
+
+                    // Fill remaining one mapping in station group, if any.
+                    var mappingsForGroup = oldUiForecastTablesByStationId.Keys
+                        .Select(otherStationId => (
+                            stationId: otherStationId,
+                            requestInfo: _forecastRequestInfos.TryGetValue(otherStationId, out var otherRequestInfo)
+                                ? otherRequestInfo
+                                : default(ForecastRequestInfo?)))
+                        .Where(p => p.requestInfo != null)
+                        .ToDictionary(p => p.stationId, p => p.requestInfo!.Value);
+                    var missingMappingsForGroup = mappingsForGroup.Where(kv => kv.Value.MappedStationId == null).ToArray();
+                    if (missingMappingsForGroup.Length == 1)
+                    {
+                        var (otherStationId, otherRequestInfo) = missingMappingsForGroup.Single();
+                        var remainingMappedStationIds = mappingsForGroup.Keys.Except(mappingsForGroup.Values
+                                .Where(fri => fri.MappedStationId != null).Select(fri => fri.MappedStationId!.Value))
+                            .ToArray();
+                        if (remainingMappedStationIds.Length == 1)
+                        {
+                            var remainingMappedStationId = remainingMappedStationIds.Single();
+                            otherRequestInfo = otherRequestInfo with { MappedStationId = remainingMappedStationId };
+                            _forecastRequestInfos[otherStationId] = otherRequestInfo;
+                            stationMappings.Add(otherStationId, remainingMappedStationId);
+                            newMappingCount++;
+                        }
+                    }
+
+                    await using (var jsonStream = File.OpenRead(path))
+                        await JsonSerializer.SerializeAsync(jsonStream, stationMappings, _jsonSerializerOptions);
+
+                    _logger.LogDebug("Found {Count} new mappings.", newMappingCount);
+                }
+                finally
+                {
+                    _forecastRequestInfosSemaphore.Release();
+                }
+
+            }
+            else if (!closestMatch.HasForecasts)
+                return [];
+            else
+            {
+                _logger.LogWarning("No mapping found for station {StationId}.", stationId);
+
+                return null;
+            }
+        }
+
+        var forecastContainer = GetForecastContainer(stationGroupDocument, stationId);
+        var mappedForecastContainer = GetForecastContainer(stationGroupDocument, requestInfo.MappedStationId.Value);
+        var stationName = stationGroupDocument.QuerySelector("h1")?.FindChild<IText>()?.TextContent.Trim() ?? "";
         var direction = forecastContainer?.QuerySelector("h3")?.TextContent.Trim() ?? "";
         var forecastRows = mappedForecastContainer?.QuerySelectorAll<IHtmlTableRowElement>("table tbody tr") ?? [];
         var forecasts = new List<Forecast>();
@@ -572,6 +669,8 @@ public class BusTimeClient
     }
 
     private readonly record struct ForecastCompareInfo(TimeOnly Time, string Route);
+
+    private readonly record struct StationMatchInfo(int? MappedStationId, int Score, int Count, bool HasForecasts);
 
     private readonly record struct ForecastRequestInfo(string CityCode, string StationCode, int? MappedStationId);
 
