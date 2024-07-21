@@ -19,6 +19,7 @@ public class BusTimeClient
     private static readonly string CacheDirectoryPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BusTime");
     private static readonly string CitiesJsonPath = Path.Combine(CacheDirectoryPath, "cities.json");
     private static readonly string StationsDirectoryPath = Path.Combine(CacheDirectoryPath, "stations");
+    private static readonly string StationMappingsDirectoryPath = Path.Combine(CacheDirectoryPath, "station-mappings");
 
     private readonly IBrowsingContext _browsingContext;
     private readonly JsonSerializerOptions _jsonSerializerOptions;
@@ -117,6 +118,8 @@ public class BusTimeClient
 
     public string GetStationJsonLocation(string cityCode) => Path.Combine(StationsDirectoryPath, $"{cityCode}.json");
 
+    private string GetStationMappingJsonLocation(string cityCode) => Path.Combine(StationMappingsDirectoryPath, $"{cityCode}.json");
+
     public async Task UpdateStationsAsync(bool fullUpdate = false)
     {
         _logger.LogInformation("Updating station list ({UpdateType} update)...", fullUpdate ? "full" : "delta");
@@ -146,24 +149,35 @@ public class BusTimeClient
         var stationListItems = stationListDocument.QuerySelectorAll<IHtmlAnchorElement>(".four .item");
         var stationGroups = stationListItems.Select(item => new StationGroup(
             Code: ExtractCode(item.Href), 
-            Name: item.TextContent.Trim())).ToArray();
+            Name: item.TextContent.Trim()))
+            .DistinctBy(stationGroup => stationGroup.Code).ToArray();
 
         ILookup<string, Station>? existingStationsByCode = null;
+        Dictionary<int, int>? existingStationMappings = null;
         if (!fullUpdate)
         {
             var existingStations = await ReadStationsAsync(cityCode);
             existingStationsByCode = existingStations?.ToLookup(station => station.Code);
+            existingStationMappings = await ReadStationMappingsAsync(cityCode);
         }
 
         var allStations = new List<Station>();
+        var stationMappings = new Dictionary<int, int>();
         var stationGroupsProcessedCount = 0;
-        const int reportMilestone = 20;
+        const int reportMilestoneSeconds = 30;
+        var reportStopwatch = Stopwatch.StartNew();
         foreach (var stationGroup in stationGroups)
         {
-            var requiresUpdate = fullUpdate || !(existingStationsByCode?.Contains(stationGroup.Code) ?? false);
+            var existingStationsInGroup = existingStationsByCode?[stationGroup.Code].ToArray() ?? [];
+            var hasMappings = existingStationMappings != null &&
+                              existingStationsInGroup.All(station => existingStationMappings.ContainsKey(station.Id));
+            var requiresUpdate = fullUpdate || !existingStationsInGroup.Any() || !hasMappings;
             if (requiresUpdate)
             {
-                _logger.LogDebug("Updating stations for group '{StationCode}'...", stationGroup.Code);
+                var updateReason = fullUpdate ? "full update" :
+                    !existingStationsInGroup.Any() ? "station is new" :
+                    !hasMappings ? "missing mappings" : "unknown";
+                _logger.LogDebug("Updating stations for group '{StationCode}' (reason: {UpdateReason})...", stationGroup.Code, updateReason);
 
                 var stationGroupDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/{stationGroup.Code}/");
                 var stationArrows = stationGroupDocument.QuerySelectorAll("h3 .fa-arrow-right");
@@ -171,6 +185,8 @@ public class BusTimeClient
                     .ParentElement?.QuerySelectorAll<IHtmlAnchorElement>("a") ?? [];
                 var stationType = stationRoutes.All(route => route.Href.Contains("tramway")) ? StationType.Tram : StationType.Regular;
                 var addedStationCount = 0;
+                var currentGroupStations = new List<Station>();
+                var oldUiForecastTablesByStationId = new Dictionary<int, ForecastTableMatch>();
                 foreach (var arrow in stationArrows)
                 {
                     var column = arrow.Ancestors<IHtmlDivElement>().First(ancestor => ancestor.ClassList.Contains("column"));
@@ -180,51 +196,164 @@ public class BusTimeClient
                         Name: stationGroup.Name,
                         Direction: arrow.ParentElement!.TextContent,
                         Type: stationType);
+                    currentGroupStations.Add(station);
                     allStations.Add(station);
                     addedStationCount++;
+
+                    var oldUiForecastTable = column.QuerySelector<IHtmlTableElement>("table")!;
+                    oldUiForecastTablesByStationId.Add(station.Id, new ForecastTableMatch(oldUiForecastTable));
                 }
+
+                var unmappedStations = new List<Station>();
+                if (currentGroupStations.Count > 1)
+                {
+                    foreach (var station in currentGroupStations)
+                    {
+                        _logger.LogDebug("Determining mapping for station {StationId}...", station.Id);
+
+                        var stationDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/id/{station.Id}/");
+                        var newUiForecastRows = stationDocument.QuerySelectorAll<IHtmlTableRowElement>("tbody.stop_result tr");
+                        var newUiForecasts = newUiForecastRows.Select(row => new ForecastCompareInfo(
+                                Time: TimeOnly.Parse(row.Cells[0].TextContent.Trim()),
+                                Route: Regex.Match(row.Cells[1].TextContent, @"(?<route>\S+)(?:\s+\+)?").Groups["route"].Value))
+                            .ToArray();
+                        foreach (var oldForecastTableMatch in oldUiForecastTablesByStationId.Values)
+                        {
+                            // Fuzzy compare forecast tables to determine closest match.
+                            const int toleranceMinutes = 2;
+                            var oldUiForecasts = oldForecastTableMatch.Table.Bodies[0].Rows
+                                .SelectMany(row => row.Cells[1].QuerySelectorAll<IHtmlAnchorElement>("a").Select(anchor =>
+                                    new ForecastCompareInfo(
+                                        Time: TimeOnly.Parse(row.Cells[0].TextContent),
+                                        Route: anchor.TextContent.Trim())));
+                            foreach (var oldUiForecast in oldUiForecasts)
+                            {
+                                if (newUiForecasts.Any(newUiForecast =>
+                                        // Old UI has transport type prefixes, new UI omits them on initial load.
+                                        oldUiForecast.Route.Contains(newUiForecast.Route, StringComparison.CurrentCultureIgnoreCase) &&
+                                        // Times may skew as pages were loaded at slightly different times, so do fuzzy compare.
+                                        Math.Abs(oldUiForecast.Time.Ticks - newUiForecast.Time.Ticks) / TimeSpan.TicksPerMinute <
+                                        toleranceMinutes))
+                                {
+                                    oldForecastTableMatch.Scores.TryAdd(station.Id, 0);
+                                    oldForecastTableMatch.Scores[station.Id]++;
+                                }
+                            }
+                        }
+
+                        var closestMatch = oldUiForecastTablesByStationId.ToLookup(kv => kv.Value.Scores.GetValueOrDefault(station.Id, 0), kv => kv.Key)
+                            .MaxBy(g => g.Key);
+                        if (closestMatch is { Key: > 0 })
+                        {
+                            if (closestMatch.Count() == 1)
+                            {
+                                var mappedStationId = closestMatch.Single();
+                                oldUiForecastTablesByStationId[mappedStationId].StationId = station.Id;
+                                if (!AddStationMapping(station.Id, mappedStationId))
+                                    unmappedStations.Add(station);
+                            }
+                            else
+                            {
+                                _logger.LogWarning("Unable to determine station mapping for station {StationId}. Ambuguous forecast table match.", station.Id);
+                                unmappedStations.Add(station);
+                            }
+                        }
+                        else
+                            unmappedStations.Add(station);
+                    }
+                }
+                else
+                    unmappedStations.Add(currentGroupStations[0]);
+
+                // If only one station is left unmapped, map it automatically.
+                if (unmappedStations.Count == 1)
+                {
+                    var mappedStationId = oldUiForecastTablesByStationId.Single(kv => kv.Value.StationId == null).Key;
+                    AddStationMapping(unmappedStations[0].Id, mappedStationId);
+                }
+                else
+                    foreach (var station in unmappedStations)
+                        _logger.LogWarning("Unable to determine station mapping for station {StationId}. No forecast table matches.", station.Id);
 
                 _logger.LogDebug("Stations for group '{StationCode}' updated with {Count} entries.", stationGroup.Code, addedStationCount);
             }
             else
             {
                 Debug.Assert(existingStationsByCode != null, nameof(existingStationsByCode) + " != null");
-                allStations.AddRange(existingStationsByCode[stationGroup.Code]);
+                Debug.Assert(existingStationMappings != null, nameof(existingStationMappings) + " != null");
+                foreach (var station in existingStationsByCode[stationGroup.Code])
+                {
+                    allStations.Add(station);
+                    stationMappings.Add(station.Id, existingStationMappings[station.Id]);
+                }
             }
 
             stationGroupsProcessedCount++;
-            if (stationGroupsProcessedCount % reportMilestone == 0) 
+            if (reportStopwatch.Elapsed.TotalSeconds > reportMilestoneSeconds)
+            {
                 _logger.LogInformation("Station list update for '{CityCode}' done for {Count}/{TotalCount} station groups.", cityCode, stationGroupsProcessedCount, stationGroups.Length);
-            
+                reportStopwatch.Restart();
+            }
         }
 
         // Waits have to be done outside this method as sepaphores are not reentrant.
         await _forecastRequestInfosSemaphore.WaitAsync();
         try
         {
-            UpdateForecastRequestInfos(cityCode, allStations, true);
+            UpdateForecastRequestInfos(cityCode, allStations, stationMappings, true);
         }
         finally
         {
             _forecastRequestInfosSemaphore.Release();
         }
 
-        var path = GetStationJsonLocation(cityCode);
-        EnsureDirectory(path);
-        await using var jsonStream = OpenWrite(path);
-        await JsonSerializer.SerializeAsync(jsonStream, allStations, _jsonSerializerOptions);
+        {
+            var path = GetStationJsonLocation(cityCode);
+            EnsureDirectory(path);
+            await using var jsonStream = OpenWrite(path);
+            await JsonSerializer.SerializeAsync(jsonStream, allStations, _jsonSerializerOptions);
+        }
+
+        {
+            var path = GetStationMappingJsonLocation(cityCode);
+            EnsureDirectory(path);
+            await using var jsonStream = OpenWrite(path);
+            await JsonSerializer.SerializeAsync(jsonStream, stationMappings, _jsonSerializerOptions);
+        }
 
         _logger.LogInformation("Station list for '{CityCode}' updated with {Count} entries.", cityCode, allStations.Count);
+
+
+        bool AddStationMapping(int stationId, int mappedStationId)
+        {
+            bool success;
+            // ReSharper disable once AssignmentInConditionalExpression
+            if (success = stationMappings.TryAdd(stationId, mappedStationId))
+                _logger.LogDebug("Station {StationId} maps to {MappedStationId} in old UI.", stationId, mappedStationId);
+            else
+                _logger.LogWarning("Unable to determine station mapping for station {StationId}. Duplicate station ID.", stationId);
+            return success;
+        }
     }
 
     private async Task<IReadOnlyCollection<Station>?> ReadStationsAsync(string cityCode)
     {
-        var stationsJsonLocation = GetStationJsonLocation(cityCode);
-        if (!File.Exists(stationsJsonLocation))
+        var path = GetStationJsonLocation(cityCode);
+        if (!File.Exists(path))
             return null;
 
-        await using var jsonStream = File.OpenRead(stationsJsonLocation);
+        await using var jsonStream = File.OpenRead(path);
         return (await JsonSerializer.DeserializeAsync<IReadOnlyCollection<Station>>(jsonStream, _jsonSerializerOptions))!;
+    }
+
+    private async Task<Dictionary<int, int>?> ReadStationMappingsAsync(string cityCode)
+    {
+        var path = GetStationMappingJsonLocation(cityCode);
+        if (!File.Exists(path))
+            return null;
+
+        await using var jsonStream = File.OpenRead(path);
+        return (await JsonSerializer.DeserializeAsync<Dictionary<int, int>>(jsonStream, _jsonSerializerOptions))!;
     }
 
     private async Task UpdateForecastRequestInfosAsync()
@@ -232,14 +361,27 @@ public class BusTimeClient
         var stationJsonFiles = Directory.EnumerateFiles(StationsDirectoryPath, "*.json");
         foreach (var stationJsonFile in stationJsonFiles)
         {
+            var cityCode = Path.GetFileNameWithoutExtension(stationJsonFile);
+
             await using var jsonStream = File.OpenRead(stationJsonFile);
             var stations = (await JsonSerializer.DeserializeAsync<IEnumerable<Station>>(jsonStream, _jsonSerializerOptions))!;
 
-            UpdateForecastRequestInfos(Path.GetFileNameWithoutExtension(stationJsonFile), stations, false);
+
+            Dictionary<int, int> stationMappings;
+            var stationMappingFile = GetStationMappingJsonLocation(cityCode);
+            if (File.Exists(stationMappingFile))
+            {
+                await using var mappingJsonStream = File.OpenRead(stationMappingFile);
+                stationMappings = (await JsonSerializer.DeserializeAsync<Dictionary<int, int>>(mappingJsonStream, _jsonSerializerOptions))!;
+            }
+            else
+                stationMappings = [];
+
+            UpdateForecastRequestInfos(cityCode, stations, stationMappings, false);
         }
     }
 
-    private void UpdateForecastRequestInfos(string cityCode, IEnumerable<Station> stations, bool removeOld)
+    private void UpdateForecastRequestInfos(string cityCode, IEnumerable<Station> stations, Dictionary<int, int> stationMappings, bool removeOld)
     {
         if (removeOld)
         {
@@ -252,8 +394,11 @@ public class BusTimeClient
         }
 
         foreach (var station in stations)
-            if (!_forecastRequestInfos.TryAdd(station.Id, new ForecastRequestInfo(cityCode, station.Code)))
+        {
+            int? mappedStationId = stationMappings.TryGetValue(station.Id, out var v) ? v : null;
+            if (!_forecastRequestInfos.TryAdd(station.Id, new ForecastRequestInfo(cityCode, station.Code, mappedStationId)))
                 _logger.LogWarning("Duplicate station ID {StationId}", station.Id);
+        }
     }
 
     public async Task<IEnumerable<Forecast>?> GetForecastsAsync(int stationId)
@@ -269,7 +414,8 @@ public class BusTimeClient
             if (_forecastRequestInfos.Count == 0)
                 await UpdateForecastRequestInfosAsync();
 
-            if (!_forecastRequestInfos.TryGetValue(stationId, out requestInfo))
+            // TODO: try to map again
+            if (!_forecastRequestInfos.TryGetValue(stationId, out requestInfo) || requestInfo.MappedStationId == null)
                 return null;
 
             stationDocument = await _browsingContext.OpenAsync($"{BaseAddress}{requestInfo.CityCode}/stop/{requestInfo.StationCode}/");
@@ -279,11 +425,11 @@ public class BusTimeClient
             _forecastRequestInfosSemaphore.Release();
         }
 
-        var forecastContainer = stationDocument.QuerySelector($"a[href$='/{stationId}/']")?.Ancestors<IHtmlDivElement>()
-            .First(ancestor => ancestor.ClassList.Contains(["column", "wide"]));
+        var forecastContainer = GetForecastContainer(stationDocument, stationId);
+        var mappedForecastContainer = GetForecastContainer(stationDocument, requestInfo.MappedStationId.Value);
         var stationName = stationDocument.QuerySelector("h1")?.FindChild<IText>()?.TextContent.Trim() ?? "";
         var direction = forecastContainer?.QuerySelector("h3")?.TextContent.Trim() ?? "";
-        var forecastRows = forecastContainer?.QuerySelectorAll<IHtmlTableRowElement>("table tbody tr") ?? [];
+        var forecastRows = mappedForecastContainer?.QuerySelectorAll<IHtmlTableRowElement>("table tbody tr") ?? [];
         var forecasts = new List<Forecast>();
         var stationsByRoute = new Dictionary<string, List<StationVehicleInfo>>();
         foreach (var forecastRow in forecastRows)
@@ -371,6 +517,10 @@ public class BusTimeClient
         return forecasts;
 
 
+        static IElement? GetForecastContainer(IParentNode root, int stationId) =>
+            root.QuerySelector($"a[href$='/{stationId}/']")?.Ancestors<IHtmlDivElement>()
+                .First(ancestor => ancestor.ClassList.Contains(["column", "wide"]));
+
         static int GetStationRowIndex(IHtmlTableElement table, string? stationCode, string stationName)
         {
             foreach (var row in table.Rows)
@@ -394,7 +544,15 @@ public class BusTimeClient
 
     private readonly record struct StationGroup(string Code, string Name);
 
-    private readonly record struct ForecastRequestInfo(string CityCode, string StationCode);
+    private record ForecastTableMatch(IHtmlTableElement Table)
+    {
+        public readonly Dictionary<int, int> Scores = new();
+        public int? StationId;
+    }
+
+    private readonly record struct ForecastCompareInfo(TimeOnly Time, string Route);
+
+    private readonly record struct ForecastRequestInfo(string CityCode, string StationCode, int? MappedStationId);
 
     private readonly record struct StationVehicleInfo(string StationName, string? StationCode, bool HasVehicle);
 }
