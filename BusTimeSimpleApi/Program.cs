@@ -13,6 +13,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddSingleton<BusTimeClient>();
+builder.Services.Configure<BusTimeClientOptions>(builder.Configuration);
 
 var rateLimitsConfiguration = builder.Configuration.GetSection("RateLimits");
 builder.Services.AddSingleton<RateLimiter>(new FixedWindowRateLimiter(new FixedWindowRateLimiterOptions

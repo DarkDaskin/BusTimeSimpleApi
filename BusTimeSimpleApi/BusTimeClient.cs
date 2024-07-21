@@ -20,17 +20,27 @@ public class BusTimeClient
     private static readonly string CitiesJsonPath = Path.Combine(CacheDirectoryPath, "cities.json");
     private static readonly string StationsDirectoryPath = Path.Combine(CacheDirectoryPath, "stations");
     private static readonly string StationMappingsDirectoryPath = Path.Combine(CacheDirectoryPath, "station-mappings");
+    private static readonly string DesertedStationsJsonPath = Path.Combine(CacheDirectoryPath, "deserted-stations.json");
 
     private readonly IBrowsingContext _browsingContext;
+    private readonly BusTimeClientOptions _options;
     private readonly JsonSerializerOptions _jsonSerializerOptions;
     private readonly ILogger<BusTimeClient> _logger;
     private readonly HashSet<string> _existingCities = new();
     private readonly SemaphoreSlim _existingCitiesSemaphore = new(1, 1);
+    /// <summary>
+    /// Key: stationId
+    /// </summary>
     private readonly Dictionary<int, ForecastRequestInfo> _forecastRequestInfos = new();
     private readonly SemaphoreSlim _forecastRequestInfosSemaphore = new(1, 1);
+    /// <summary>
+    /// stationId -> date since (UTC)
+    /// </summary>
+    private Dictionary<int, DateTime>? _desertedStations;
+    private readonly SemaphoreSlim _desertedStationsSemaphore = new(1, 1);
     private volatile bool _cityUpdateInProgress, _stationUpdateInProgress;
 
-    public BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOptions, ILogger<BusTimeClient> logger)
+    public BusTimeClient(RateLimiter rateLimiter, IOptions<BusTimeClientOptions> options, IOptions<JsonOptions> jsonOptions, ILogger<BusTimeClient> logger)
     {
         var httpClient = new HttpClient(new ClientSideRateLimitedHandler(rateLimiter))
         {
@@ -42,6 +52,7 @@ public class BusTimeClient
             }
         };
         _browsingContext = BrowsingContext.New(Configuration.Default.With(new HttpClientRequester(httpClient)).WithDefaultLoader());
+        _options = options.Value;
         _jsonSerializerOptions = jsonOptions.Value.SerializerOptions;
         _logger = logger;
     }
@@ -58,33 +69,37 @@ public class BusTimeClient
             return;
         }
         _cityUpdateInProgress = true;
-
-        var document = await _browsingContext.OpenAsync($"{BaseAddress}");
-        var items = document.QuerySelectorAll<IHtmlAnchorElement>(".accordion .item");
-        var cities = items.Select(item => new City(
-            Code: ExtractCode(item.Href),
-            Name: item.Title?.Split(',').First() ?? "",
-            Country: item.Ancestors<IHtmlDivElement>().SingleOrDefault(ancestor => ancestor.ClassList.Contains("content"))?
-                .PreviousElementSibling?.FindChild<IText>()?.Text.Trim() ?? ""))
-            .ToArray();
-
-        await _existingCitiesSemaphore.WaitAsync();
         try
         {
-            UpdateExistingCities(cities);
+            var document = await _browsingContext.OpenAsync($"{BaseAddress}");
+            var items = document.QuerySelectorAll<IHtmlAnchorElement>(".accordion .item");
+            var cities = items.Select(item => new City(
+                    Code: ExtractCode(item.Href),
+                    Name: item.Title?.Split(',').First() ?? "",
+                    Country: item.Ancestors<IHtmlDivElement>().SingleOrDefault(ancestor => ancestor.ClassList.Contains("content"))?
+                        .PreviousElementSibling?.FindChild<IText>()?.Text.Trim() ?? ""))
+                .ToArray();
+
+            await _existingCitiesSemaphore.WaitAsync();
+            try
+            {
+                UpdateExistingCities(cities);
+            }
+            finally
+            {
+                _existingCitiesSemaphore.Release();
+            }
+
+            EnsureDirectory(CitiesJsonPath);
+            await using var jsonStream = OpenWrite(CitiesJsonPath);
+            await JsonSerializer.SerializeAsync(jsonStream, cities, _jsonSerializerOptions);
+
+            _logger.LogInformation("City list updated with {Count} entries.", cities.Length);
         }
         finally
         {
-            _existingCitiesSemaphore.Release();
+            _cityUpdateInProgress = false;
         }
-
-        EnsureDirectory(CitiesJsonPath);
-        await using var jsonStream = OpenWrite(CitiesJsonPath);
-        await JsonSerializer.SerializeAsync(jsonStream, cities, _jsonSerializerOptions);
-
-        _cityUpdateInProgress = false;
-
-        _logger.LogInformation("City list updated with {Count} entries.", cities.Length);
     }
 
     private void LogUpdateCancelled() => _logger.LogWarning("Update cancelled due to another update being in progress.");
@@ -142,15 +157,19 @@ public class BusTimeClient
             return;
         }
         _stationUpdateInProgress = true;
+        try
+        {
+            var cities = await ReadCitiesAsync();
 
-        var cities = await ReadCitiesAsync();
+            foreach (var city in cities)
+                await UpdateStationsAsync(city.Code, fullUpdate);
 
-        foreach (var city in cities)
-            await UpdateStationsAsync(city.Code, fullUpdate);
-
-        _stationUpdateInProgress = false;
-
-        _logger.LogInformation("Station list updated for {Count} cities.", cities.Count);
+            _logger.LogInformation("Station list updated for {Count} cities.", cities.Count);
+        }
+        finally
+        {
+            _stationUpdateInProgress = false;
+        }
     }
 
     private async Task<IReadOnlyCollection<City>> ReadCitiesAsync()
@@ -165,7 +184,7 @@ public class BusTimeClient
     public async Task UpdateStationsAsync(string cityCode, bool fullUpdate = false)
     {
         _logger.LogInformation("Updating station list for '{CityCode}' ({UpdateType} update)...", cityCode, fullUpdate ? "full" : "delta");
-
+        
         var stationListDocument = await _browsingContext.OpenAsync($"{BaseAddress}{cityCode}/stop/");
         var stationListItems = stationListDocument.QuerySelectorAll<IHtmlAnchorElement>(".four .item");
         var stationGroups = stationListItems.Select(item => new StationGroup(
@@ -205,7 +224,6 @@ public class BusTimeClient
                 var stationRoutes = stationGroupDocument.QuerySelectorAll("h3").First(h3 => h3.TextContent.Contains("Маршруты"))
                     .ParentElement?.QuerySelectorAll<IHtmlAnchorElement>("a") ?? [];
                 var stationType = stationRoutes.All(route => route.Href.Contains("tramway")) ? StationType.Tram : StationType.Regular;
-                var addedStationCount = 0;
                 var currentGroupStations = new List<Station>();
                 var oldUiForecastTablesByStationId = new Dictionary<int, ForecastTableMatch>();
                 foreach (var arrow in stationArrows)
@@ -217,23 +235,26 @@ public class BusTimeClient
                         Name: stationGroup.Name,
                         Direction: arrow.ParentElement!.TextContent,
                         Type: stationType);
-                    currentGroupStations.Add(station);
-                    allStations.Add(station);
-                    addedStationCount++;
+
+                    if (fullUpdate || !await IsStationDesertedAsync(station.Id))
+                        currentGroupStations.Add(station);
+                    else
+                        _logger.LogDebug("Station {StationId} is deserted, skipping.", station.Id);
 
                     var oldUiForecastTable = column.QuerySelector<IHtmlTableElement>("table")!;
                     oldUiForecastTablesByStationId.Add(station.Id, new ForecastTableMatch(oldUiForecastTable));
                 }
 
-                var unmappedStations = new List<Station>();
+                var unmappedStations = new Dictionary<int, int>();
                 if (currentGroupStations.Count > 1)
                 {
                     foreach (var station in currentGroupStations)
                     {
                         if (!fullUpdate && existingStationMappings != null && existingStationMappings.TryGetValue(station.Id, out var mappedStationId))
                         {
+                            oldUiForecastTablesByStationId[mappedStationId].StationId = station.Id;
                             if (!AddStationMapping(station.Id, mappedStationId))
-                                unmappedStations.Add(station);
+                                unmappedStations.Add(station.Id, 1);
 
                             continue;
                         }
@@ -248,32 +269,51 @@ public class BusTimeClient
                                 mappedStationId = closestMatch.MappedStationId!.Value;
                                 oldUiForecastTablesByStationId[mappedStationId].StationId = station.Id;
                                 if (!AddStationMapping(station.Id, mappedStationId))
-                                    unmappedStations.Add(station);
+                                    unmappedStations.Add(station.Id, closestMatch.Count);
                             }
                             else
                             {
                                 _logger.LogWarning("Unable to determine station mapping for station {StationId}. Ambuguous forecast table match.", station.Id);
-                                unmappedStations.Add(station);
+                                unmappedStations.Add(station.Id, closestMatch.Count);
                             }
                         }
                         else
-                            unmappedStations.Add(station);
+                            unmappedStations.Add(station.Id, 0);
+
+                        if (closestMatch.HasForecasts)
+                            await UpdateDesertedStationAsync(station.Id, false, false);
                     }
                 }
                 else
-                    unmappedStations.Add(currentGroupStations[0]);
+                    unmappedStations.Add(currentGroupStations[0].Id, 0);
 
                 // If only one station is left unmapped, map it automatically.
                 if (unmappedStations.Count == 1)
                 {
                     var mappedStationId = oldUiForecastTablesByStationId.Single(kv => kv.Value.StationId == null).Key;
-                    AddStationMapping(unmappedStations[0].Id, mappedStationId);
+                    AddStationMapping(unmappedStations.Keys.Single(), mappedStationId);
                 }
                 else
-                    foreach (var station in unmappedStations)
-                        _logger.LogWarning("Unable to determine station mapping for station {StationId}. No forecast table matches.", station.Id);
+                {
+                    foreach (var (stationId, count) in unmappedStations)
+                    {
+                        if (count > 0) 
+                            continue;
 
-                _logger.LogDebug("Stations for group '{StationCode}' updated with {Count} entries.", stationGroup.Code, addedStationCount);
+                        _logger.LogWarning("Unable to determine station mapping for station {StationId}. No forecast table matches.", stationId);
+
+                        await UpdateDesertedStationAsync(stationId, true, false);
+                    }
+                }
+
+                if (fullUpdate)
+                    foreach (var station in currentGroupStations.ToArray())
+                        if (!await IsStationDesertedAsync(station.Id))
+                            currentGroupStations.Remove(station);
+
+                allStations.AddRange(currentGroupStations);
+
+                _logger.LogDebug("Stations for group '{StationCode}' updated with {Count} entries.", stationGroup.Code, currentGroupStations.Count);
             }
             else
             {
@@ -281,7 +321,11 @@ public class BusTimeClient
                 Debug.Assert(existingStationMappings != null, nameof(existingStationMappings) + " != null");
                 foreach (var station in existingStationsByCode[stationGroup.Code])
                 {
-                    allStations.Add(station);
+                    if (!await IsStationDesertedAsync(station.Id))
+                        allStations.Add(station);
+                    else
+                        _logger.LogDebug("Station {StationId} is deserted, skipping.", station.Id);
+
                     stationMappings.Add(station.Id, existingStationMappings[station.Id]);
                 }
             }
@@ -319,6 +363,8 @@ public class BusTimeClient
             await JsonSerializer.SerializeAsync(jsonStream, stationMappings, _jsonSerializerOptions);
         }
 
+        await SaveDesertedStationsAsync();
+
         _logger.LogInformation("Station list for '{CityCode}' updated with {Count} entries.", cityCode, allStations.Count);
 
 
@@ -352,6 +398,66 @@ public class BusTimeClient
 
         await using var jsonStream = File.OpenRead(path);
         return (await JsonSerializer.DeserializeAsync<Dictionary<int, int>>(jsonStream, _jsonSerializerOptions))!;
+    }
+
+    private async Task<bool> IsStationDesertedAsync(int stationId)
+    {
+        await EnsureDesertedStationsAsync();
+        await _desertedStationsSemaphore.WaitAsync();
+        try
+        {
+            return _desertedStations!.TryGetValue(stationId, out var since) &&
+                   DateTime.UtcNow - since > TimeSpan.FromDays(_options.MaxDesertedDays);
+        }
+        finally
+        {
+            _desertedStationsSemaphore.Release();
+        }
+    }
+
+    private async Task EnsureDesertedStationsAsync()
+    {
+        if (_desertedStations != null)
+            return;
+
+        if (!File.Exists(DesertedStationsJsonPath))
+            _desertedStations = [];
+        else
+        {
+            await using var jsonStream = File.OpenRead(DesertedStationsJsonPath);
+            _desertedStations = (await JsonSerializer.DeserializeAsync<Dictionary<int, DateTime>>(jsonStream, _jsonSerializerOptions))!;
+        }
+    }
+
+    private async Task UpdateDesertedStationAsync(int stationId, bool isDeserted, bool save)
+    {
+        await _desertedStationsSemaphore.WaitAsync();
+        try
+        {
+            await EnsureDesertedStationsAsync();
+
+            if (isDeserted)
+                save &= _desertedStations!.TryAdd(stationId, DateTime.UtcNow);
+            else
+                save &= _desertedStations!.Remove(stationId);
+
+            if (save)
+                await SaveDesertedStationsAsync();
+        }
+        finally
+        {
+            _desertedStationsSemaphore.Release();
+        }
+    }
+
+    private async Task SaveDesertedStationsAsync()
+    {
+        if (_desertedStations == null)
+            return;
+
+        EnsureDirectory(DesertedStationsJsonPath);
+        await using var jsonStream = OpenWrite(DesertedStationsJsonPath);
+        await JsonSerializer.SerializeAsync(jsonStream, _desertedStations, _jsonSerializerOptions);
     }
 
     private async Task<StationMatchInfo> GetClosestStationMatchByForecast(string cityCode, int stationId,
@@ -629,6 +735,9 @@ public class BusTimeClient
                 forecasts.Add(new Forecast(dateTime, routeNumber, type, lastStation, nextStation));
             }
         }
+
+        if (forecasts.Any())
+            await UpdateDesertedStationAsync(stationId, false, true);
 
         _logger.LogInformation("Forecast for station '{StationId}' completed with {Count} entries.", stationId, forecasts.Count);
 
