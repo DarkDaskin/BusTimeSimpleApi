@@ -28,6 +28,7 @@ public class BusTimeClient
     private readonly SemaphoreSlim _existingCitiesSemaphore = new(1, 1);
     private readonly Dictionary<int, ForecastRequestInfo> _forecastRequestInfos = new();
     private readonly SemaphoreSlim _forecastRequestInfosSemaphore = new(1, 1);
+    private volatile bool _cityUpdateInProgress, _stationUpdateInProgress;
 
     public BusTimeClient(RateLimiter rateLimiter, IOptions<JsonOptions> jsonOptions, ILogger<BusTimeClient> logger)
     {
@@ -50,6 +51,13 @@ public class BusTimeClient
     public async Task UpdateCitiesAsync()
     {
         _logger.LogInformation("Updating city list...");
+
+        if (_cityUpdateInProgress)
+        {
+            LogUpdateCancelled();
+            return;
+        }
+        _cityUpdateInProgress = true;
 
         var document = await _browsingContext.OpenAsync($"{BaseAddress}");
         var items = document.QuerySelectorAll<IHtmlAnchorElement>(".accordion .item");
@@ -74,8 +82,12 @@ public class BusTimeClient
         await using var jsonStream = OpenWrite(CitiesJsonPath);
         await JsonSerializer.SerializeAsync(jsonStream, cities, _jsonSerializerOptions);
 
+        _cityUpdateInProgress = false;
+
         _logger.LogInformation("City list updated with {Count} entries.", cities.Length);
     }
+
+    private void LogUpdateCancelled() => _logger.LogWarning("Update cancelled due to another update being in progress.");
 
     private static string ExtractCode(string url) => url.Split('/', StringSplitOptions.RemoveEmptyEntries).Last();
 
@@ -124,10 +136,19 @@ public class BusTimeClient
     {
         _logger.LogInformation("Updating station list ({UpdateType} update)...", fullUpdate ? "full" : "delta");
 
+        if (_stationUpdateInProgress)
+        {
+            LogUpdateCancelled();
+            return;
+        }
+        _stationUpdateInProgress = true;
+
         var cities = await ReadCitiesAsync();
 
         foreach (var city in cities)
             await UpdateStationsAsync(city.Code, fullUpdate);
+
+        _stationUpdateInProgress = false;
 
         _logger.LogInformation("Station list updated for {Count} cities.", cities.Count);
     }
